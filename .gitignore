@@ -13,3 +13,4 @@ desktop.ini
 
 # NOTE: src/native/win-x64/libcodec2.dll is intentionally committed
 # (the native Codec 2 runtime, built from the codec2 submodule).
+*.zip
