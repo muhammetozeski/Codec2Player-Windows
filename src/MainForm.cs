@@ -1,59 +1,72 @@
+using Timer = System.Windows.Forms.Timer;
+
 namespace Codec2Player;
 
-public sealed class MainForm : Form
+/// <summary>Main window: a .c2 playlist with a transport bar, driving <see cref="WaveOutPlayer"/>.</summary>
+sealed class MainForm : Form
 {
-    private readonly ListBox _playlist = new();
-    private readonly Button _btnAddFiles = new() { Text = "Dosya Ekle" };
-    private readonly Button _btnAddFolder = new() { Text = "Klasör Ekle" };
-    private readonly Button _btnRemove = new() { Text = "Çıkar" };
-    private readonly Button _btnClear = new() { Text = "Temizle" };
+    const int WindowWidth = 660;
+    const int WindowHeight = 480;
+    const int MinimumWidth = 520;
+    const int MinimumHeight = 380;
+    const int ProgressIntervalMs = 200;
+    const int SeekSteps = 1000;
+    const int DefaultVolumePercent = 90;
 
-    private readonly Label _lblNow = new() { Text = "—", AutoEllipsis = true };
-    private readonly TrackBar _seek = new() { Minimum = 0, Maximum = 1000, TickStyle = TickStyle.None, Enabled = false };
-    private readonly Label _lblTime = new() { Text = "00:00 / 00:00", TextAlign = ContentAlignment.MiddleRight };
+    readonly ListBox _playlist = new();
+    readonly Button _addFilesButton = new() { Text = "Add Files" };
+    readonly Button _addFolderButton = new() { Text = "Add Folder" };
+    readonly Button _removeButton = new() { Text = "Remove" };
+    readonly Button _clearButton = new() { Text = "Clear" };
 
-    private readonly Button _btnPrev = new() { Text = "⏮" };
-    private readonly Button _btnPlay = new() { Text = "▶" };
-    private readonly Button _btnStop = new() { Text = "⏹" };
-    private readonly Button _btnNext = new() { Text = "⏭" };
-    private readonly Label _lblVol = new() { Text = "🔊", TextAlign = ContentAlignment.MiddleCenter };
-    private readonly TrackBar _volume = new() { Minimum = 0, Maximum = 100, Value = 90, TickStyle = TickStyle.None };
+    readonly Label _nowPlayingLabel = new() { Text = "—", AutoEllipsis = true };
+    readonly TrackBar _seekBar = new() { Minimum = 0, Maximum = SeekSteps, TickStyle = TickStyle.None, Enabled = false };
+    readonly Label _timeLabel = new() { Text = "00:00 / 00:00", TextAlign = ContentAlignment.MiddleRight };
 
-    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 200 };
-    private readonly WaveOutPlayer _player = new();
+    readonly Button _previousButton = new() { Text = "⏮" };
+    readonly Button _playPauseButton = new() { Text = "▶" };
+    readonly Button _stopButton = new() { Text = "⏹" };
+    readonly Button _nextButton = new() { Text = "⏭" };
+    readonly Label _volumeIcon = new() { Text = "🔊", TextAlign = ContentAlignment.MiddleCenter };
+    readonly TrackBar _volumeBar = new() { Minimum = 0, Maximum = 100, Value = DefaultVolumePercent, TickStyle = TickStyle.None };
 
-    private int _current = -1;
-    private bool _suppressSeek;
-    private float _gain = 0.9f;
+    readonly Timer _progressTimer = new() { Interval = ProgressIntervalMs };
+    readonly WaveOutPlayer _player = new();
 
+    int _currentIndex = -1;
+    bool _suppressSeekEvent;
+    float _volume = DefaultVolumePercent / 100f;
+
+    /// <summary>Builds the window, controls and event wiring.</summary>
     public MainForm()
     {
         Text = "Codec2Player";
-        Width = 660;
-        Height = 480;
-        MinimumSize = new Size(520, 380);
+        Width = WindowWidth;
+        Height = WindowHeight;
+        MinimumSize = new Size(MinimumWidth, MinimumHeight);
         StartPosition = FormStartPosition.CenterScreen;
 
         BuildUi();
         WireEvents();
-        UpdateTransport();
+        UpdateTransportEnabled();
     }
 
-    private void BuildUi()
+    /// <summary>Creates and lays out the toolbar, playlist and transport bar.</summary>
+    void BuildUi()
     {
-        var toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, Padding = new Padding(8, 6, 8, 0) };
-        foreach (var b in new[] { _btnAddFiles, _btnAddFolder, _btnRemove, _btnClear })
+        FlowLayoutPanel toolbar = new() { Dock = DockStyle.Top, Height = 40, Padding = new Padding(8, 6, 8, 0) };
+        foreach (Button button in (Button[])[_addFilesButton, _addFolderButton, _removeButton, _clearButton])
         {
-            b.AutoSize = true;
-            b.Margin = new Padding(0, 0, 6, 0);
-            toolbar.Controls.Add(b);
+            button.AutoSize = true;
+            button.Margin = new Padding(0, 0, 6, 0);
+            toolbar.Controls.Add(button);
         }
 
         _playlist.Dock = DockStyle.Fill;
         _playlist.IntegralHeight = false;
         _playlist.Font = new Font(FontFamily.GenericSansSerif, 9.5f);
 
-        var bottom = new TableLayoutPanel
+        TableLayoutPanel bottom = new()
         {
             Dock = DockStyle.Bottom,
             Height = 132,
@@ -65,196 +78,207 @@ public sealed class MainForm : Form
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
 
-        _lblNow.Dock = DockStyle.Fill;
-        _lblNow.TextAlign = ContentAlignment.MiddleLeft;
-        _lblNow.Font = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold);
-        bottom.Controls.Add(_lblNow, 0, 0);
-        bottom.SetColumnSpan(_lblNow, 3);
+        _nowPlayingLabel.Dock = DockStyle.Fill;
+        _nowPlayingLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _nowPlayingLabel.Font = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold);
+        bottom.Controls.Add(_nowPlayingLabel, 0, 0);
+        bottom.SetColumnSpan(_nowPlayingLabel, 3);
 
-        _seek.Dock = DockStyle.Fill;
-        bottom.Controls.Add(_seek, 0, 1);
-        _lblTime.Dock = DockStyle.Fill;
-        bottom.Controls.Add(_lblTime, 1, 1);
-        bottom.SetColumnSpan(_lblTime, 2);
+        _seekBar.Dock = DockStyle.Fill;
+        bottom.Controls.Add(_seekBar, 0, 1);
+        _timeLabel.Dock = DockStyle.Fill;
+        bottom.Controls.Add(_timeLabel, 1, 1);
+        bottom.SetColumnSpan(_timeLabel, 2);
 
-        var transport = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
-        foreach (var b in new[] { _btnPrev, _btnPlay, _btnStop, _btnNext })
+        FlowLayoutPanel transport = new() { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        foreach (Button button in (Button[])[_previousButton, _playPauseButton, _stopButton, _nextButton])
         {
-            b.Width = 48;
-            b.Height = 34;
-            b.Font = new Font(FontFamily.GenericSansSerif, 11f);
-            b.Margin = new Padding(0, 0, 6, 0);
-            transport.Controls.Add(b);
+            button.Width = 48;
+            button.Height = 34;
+            button.Font = new Font(FontFamily.GenericSansSerif, 11f);
+            button.Margin = new Padding(0, 0, 6, 0);
+            transport.Controls.Add(button);
         }
         bottom.Controls.Add(transport, 0, 2);
 
-        var volPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
-        _lblVol.Width = 24;
-        _lblVol.Height = 34;
-        _volume.Width = 200;
-        volPanel.Controls.Add(_lblVol);
-        volPanel.Controls.Add(_volume);
-        bottom.Controls.Add(volPanel, 1, 2);
-        bottom.SetColumnSpan(volPanel, 2);
+        FlowLayoutPanel volumePanel = new() { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        _volumeIcon.Width = 24;
+        _volumeIcon.Height = 34;
+        _volumeBar.Width = 200;
+        volumePanel.Controls.Add(_volumeIcon);
+        volumePanel.Controls.Add(_volumeBar);
+        bottom.Controls.Add(volumePanel, 1, 2);
+        bottom.SetColumnSpan(volumePanel, 2);
 
         Controls.Add(_playlist);
         Controls.Add(bottom);
         Controls.Add(toolbar);
     }
 
-    private void WireEvents()
+    /// <summary>Connects control events to playlist and playback actions.</summary>
+    void WireEvents()
     {
-        _btnAddFiles.Click += (_, _) => AddFiles();
-        _btnAddFolder.Click += (_, _) => AddFolder();
-        _btnRemove.Click += (_, _) => RemoveSelected();
-        _btnClear.Click += (_, _) => { Stop(); _playlist.Items.Clear(); _current = -1; UpdateTransport(); };
+        _addFilesButton.Click += (_, _) => AddFiles();
+        _addFolderButton.Click += (_, _) => AddFolder();
+        _removeButton.Click += (_, _) => RemoveSelected();
+        _clearButton.Click += (_, _) => { Stop(); _playlist.Items.Clear(); _currentIndex = -1; UpdateTransportEnabled(); };
 
         _playlist.DoubleClick += async (_, _) => { if (_playlist.SelectedIndex >= 0) await LoadAndPlay(_playlist.SelectedIndex); };
 
-        _btnPlay.Click += async (_, _) => await TogglePlay();
-        _btnStop.Click += (_, _) => Stop();
-        _btnNext.Click += async (_, _) => await Step(+1, wrap: true);
-        _btnPrev.Click += async (_, _) => await Step(-1, wrap: true);
+        _playPauseButton.Click += async (_, _) => await TogglePlay();
+        _stopButton.Click += (_, _) => Stop();
+        _nextButton.Click += async (_, _) => await Step(+1, wrap: true);
+        _previousButton.Click += async (_, _) => await Step(-1, wrap: true);
 
-        _volume.Scroll += (_, _) => { _gain = _volume.Value / 100f; _player.SetVolume(_gain); };
-        _seek.Scroll += (_, _) =>
+        _volumeBar.Scroll += (_, _) => { _volume = _volumeBar.Value / 100f; _player.SetVolume(_volume); };
+        _seekBar.Scroll += (_, _) =>
         {
-            if (_suppressSeek || !_player.IsOpen) return;
-            _player.SeekFraction(_seek.Value / 1000.0);
+            if (_suppressSeekEvent || !_player.IsOpen) return;
+            _player.SeekFraction((double)_seekBar.Value / SeekSteps);
             UpdateTime();
         };
 
-        _timer.Tick += async (_, _) =>
+        _progressTimer.Tick += async (_, _) =>
         {
             UpdateProgress();
             if (_player.PollCompleted()) await Step(+1, wrap: false);
         };
-        FormClosing += (_, _) => { _timer.Stop(); _player.Dispose(); };
+        FormClosing += (_, _) => { _progressTimer.Stop(); _player.Dispose(); };
     }
 
-    private void AddFiles()
+    /// <summary>Prompts for one or more .c2 files and appends them to the playlist.</summary>
+    void AddFiles()
     {
-        using var dlg = new OpenFileDialog
+        using OpenFileDialog dialog = new()
         {
-            Filter = "Codec 2 dosyaları (*.c2)|*.c2|Tüm dosyalar (*.*)|*.*",
+            Filter = "Codec 2 files (*.c2)|*.c2|All files (*.*)|*.*",
             Multiselect = true,
         };
-        if (dlg.ShowDialog(this) == DialogResult.OK)
-            foreach (var f in dlg.FileNames) _playlist.Items.Add(f);
-        UpdateTransport();
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+            foreach (string file in dialog.FileNames) _playlist.Items.Add(file);
+        UpdateTransportEnabled();
     }
 
-    private void AddFolder()
+    /// <summary>Prompts for a folder and appends every .c2 file in it to the playlist.</summary>
+    void AddFolder()
     {
-        using var dlg = new FolderBrowserDialog { Description = ".c2 dosyalarını içeren klasör" };
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        foreach (var f in Directory.EnumerateFiles(dlg.SelectedPath, "*.c2", SearchOption.TopDirectoryOnly))
-            _playlist.Items.Add(f);
-        UpdateTransport();
+        using FolderBrowserDialog dialog = new() { Description = "Folder containing .c2 files" };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        foreach (string file in Directory.EnumerateFiles(dialog.SelectedPath, "*.c2", SearchOption.TopDirectoryOnly))
+            _playlist.Items.Add(file);
+        UpdateTransportEnabled();
     }
 
-    private void RemoveSelected()
+    /// <summary>Removes the selected playlist entry, stopping it first if it is playing.</summary>
+    void RemoveSelected()
     {
-        int idx = _playlist.SelectedIndex;
-        if (idx < 0) return;
-        if (idx == _current) Stop();
-        _playlist.Items.RemoveAt(idx);
-        if (_current > idx) _current--;
-        else if (_current == idx) _current = -1;
-        UpdateTransport();
+        int index = _playlist.SelectedIndex;
+        if (index < 0) return;
+        if (index == _currentIndex) Stop();
+        _playlist.Items.RemoveAt(index);
+        if (_currentIndex > index) _currentIndex--;
+        else if (_currentIndex == index) _currentIndex = -1;
+        UpdateTransportEnabled();
     }
 
-    private async Task TogglePlay()
+    /// <summary>Pauses, resumes, or starts playback depending on the current state.</summary>
+    async Task TogglePlay()
     {
-        if (_player.IsPlaying) { _player.Pause(); _btnPlay.Text = "▶"; return; }
-        if (_player.IsPaused) { _player.Play(); _btnPlay.Text = "⏸"; return; }
+        if (_player.IsPlaying) { _player.Pause(); _playPauseButton.Text = "▶"; return; }
+        if (_player.IsPaused) { _player.Play(); _playPauseButton.Text = "⏸"; return; }
 
-        int idx = _playlist.SelectedIndex >= 0 ? _playlist.SelectedIndex : (_playlist.Items.Count > 0 ? 0 : -1);
-        if (idx >= 0) await LoadAndPlay(idx);
+        int index = _playlist.SelectedIndex >= 0 ? _playlist.SelectedIndex : (_playlist.Items.Count > 0 ? 0 : -1);
+        if (index >= 0) await LoadAndPlay(index);
     }
 
-    private async Task LoadAndPlay(int index)
+    /// <summary>Decodes the playlist entry at <paramref name="index"/> and starts playing it.</summary>
+    /// <param name="index">Zero-based playlist index to play.</param>
+    async Task LoadAndPlay(int index)
     {
         if (index < 0 || index >= _playlist.Items.Count) return;
         Stop();
 
         string path = (string)_playlist.Items[index];
-        _lblNow.Text = $"Yükleniyor: {Path.GetFileName(path)}";
+        _nowPlayingLabel.Text = $"Loading: {Path.GetFileName(path)}";
 
         DecodedAudio audio;
         try
         {
             audio = await Task.Run(() => C2Decoder.DecodeFile(path));
         }
-        catch (Exception ex)
+        catch (Exception error)
         {
-            _lblNow.Text = "—";
-            MessageBox.Show(this, ex.Message, "Çözme hatası", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            _nowPlayingLabel.Text = "—";
+            MessageBox.Show(this, error.Message, "Decode error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        _current = index;
+        _currentIndex = index;
         _playlist.SelectedIndex = index;
-        _player.Load(audio.Pcm, audio.SampleRate, _gain);
+        _player.Load(audio.Pcm, audio.SampleRate, _volume);
         _player.Play();
 
-        _seek.Enabled = true;
-        _btnPlay.Text = "⏸";
-        _lblNow.Text = $"{Path.GetFileName(path)}   [{Codec2Native.ModeName(audio.Mode)}]";
-        _timer.Start();
+        _seekBar.Enabled = true;
+        _playPauseButton.Text = "⏸";
+        _nowPlayingLabel.Text = $"{Path.GetFileName(path)}   [{Codec2Native.ModeName(audio.Mode)}]";
+        _progressTimer.Start();
         UpdateProgress();
-        UpdateTransport();
+        UpdateTransportEnabled();
     }
 
-    private void Stop()
+    /// <summary>Stops playback and resets the transport bar.</summary>
+    void Stop()
     {
-        _timer.Stop();
+        _progressTimer.Stop();
         _player.Stop();
-        _seek.Value = 0;
-        _seek.Enabled = false;
-        _btnPlay.Text = "▶";
-        _lblTime.Text = "00:00 / 00:00";
+        _seekBar.Value = 0;
+        _seekBar.Enabled = false;
+        _playPauseButton.Text = "▶";
+        _timeLabel.Text = "00:00 / 00:00";
     }
 
-    private async Task Step(int delta, bool wrap)
+    /// <summary>Moves to another track relative to the current one.</summary>
+    /// <param name="delta">+1 for next, -1 for previous.</param>
+    /// <param name="wrap">When true, wraps around the ends; otherwise stops past the last track.</param>
+    async Task Step(int delta, bool wrap)
     {
         int count = _playlist.Items.Count;
         if (count == 0) return;
-        int idx = _current + delta;
-        if (idx < 0) idx = wrap ? count - 1 : -1;
-        if (idx >= count) idx = wrap ? 0 : -1;
-        if (idx < 0) { Stop(); return; }
-        await LoadAndPlay(idx);
+        int index = _currentIndex + delta;
+        if (index < 0) index = wrap ? count - 1 : -1;
+        else if (index >= count) index = wrap ? 0 : -1;
+        if (index < 0) { Stop(); return; }
+        await LoadAndPlay(index);
     }
 
-    private void UpdateProgress()
+    /// <summary>Updates the time label and seek bar from the player position, suppressing the seek event so the programmatic move is not handled as a user seek.</summary>
+    void UpdateProgress()
     {
         if (!_player.IsOpen) return;
         UpdateTime();
         double total = _player.Total.TotalMilliseconds;
-        if (total > 0)
-        {
-            _suppressSeek = true;
-            _seek.Value = (int)Math.Clamp(_player.Current.TotalMilliseconds / total * 1000.0, 0, 1000);
-            _suppressSeek = false;
-        }
+        if (total <= 0) return;
+        _suppressSeekEvent = true;
+        _seekBar.Value = (int)Math.Clamp(_player.Current.TotalMilliseconds / total * SeekSteps, 0, SeekSteps);
+        _suppressSeekEvent = false;
     }
 
-    private void UpdateTime()
-    {
-        if (!_player.IsOpen) return;
-        _lblTime.Text = $"{Fmt(_player.Current)} / {Fmt(_player.Total)}";
-    }
+    /// <summary>Refreshes the "elapsed / total" time label.</summary>
+    void UpdateTime() => _timeLabel.Text = $"{Format(_player.Current)} / {Format(_player.Total)}";
 
-    private static string Fmt(TimeSpan t) =>
-        t.TotalHours >= 1 ? t.ToString(@"h\:mm\:ss") : t.ToString(@"mm\:ss");
+    /// <summary>Formats a duration as h:mm:ss when over an hour, otherwise mm:ss.</summary>
+    /// <param name="time">The duration to format.</param>
+    /// <returns>The formatted time string.</returns>
+    static string Format(TimeSpan time) =>
+        time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"mm\:ss");
 
-    private void UpdateTransport()
+    /// <summary>Enables or disables the transport buttons based on whether the playlist has items.</summary>
+    void UpdateTransportEnabled()
     {
-        bool has = _playlist.Items.Count > 0;
-        _btnPlay.Enabled = has;
-        _btnStop.Enabled = has;
-        _btnNext.Enabled = has;
-        _btnPrev.Enabled = has;
+        bool hasItems = _playlist.Items.Count > 0;
+        _playPauseButton.Enabled = hasItems;
+        _stopButton.Enabled = hasItems;
+        _nextButton.Enabled = hasItems;
+        _previousButton.Enabled = hasItems;
     }
 }

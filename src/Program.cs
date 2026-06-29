@@ -1,9 +1,11 @@
 namespace Codec2Player;
 
-internal static class Program
+/// <summary>Application entry point.</summary>
+static class Program
 {
+    /// <summary>Initializes WinForms and runs the main window message loop.</summary>
     [STAThread]
-    private static void Main()
+    static void Main()
     {
         ApplicationConfiguration.Initialize();
         Application.Run(new MainForm());

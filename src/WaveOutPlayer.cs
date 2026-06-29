@@ -3,218 +3,238 @@ using System.Runtime.InteropServices;
 namespace Codec2Player;
 
 /// <summary>
-/// Plays in-memory 16-bit mono PCM straight to the sound card via the Windows
-/// winmm waveOut API - the same model as Android's AudioTrack: the codec is
-/// decoded to PCM (see <see cref="C2Decoder"/>) and the PCM samples are handed
-/// to the OS audio sink. No third-party audio library, no intermediate file.
+/// Streams in-memory 16-bit mono PCM to the sound card through the Windows winmm
+/// waveOut API. The whole clip is written as a single buffer; play / pause / seek /
+/// volume map onto waveOut restart / pause / rewrite / SetVolume.
 /// </summary>
-public sealed class WaveOutPlayer : IDisposable
+sealed class WaveOutPlayer : IDisposable
 {
-    private IntPtr _hwo;
-    private GCHandle _pcmHandle;
-    private IntPtr _pHdr;
-    private byte[] _pcm = Array.Empty<byte>();
-    private int _sampleRate = 8000;
-    private long _startByte;          // byte offset the current buffer was written from
-    private bool _completedFired;
+    const uint VolumeMax = 0xFFFF;
 
+    IntPtr _deviceHandle;
+    GCHandle _pcmPin;
+    IntPtr _headerPtr;
+    byte[] _pcm = [];
+    int _sampleRate = 8000;
+    long _bufferStartByte;          // byte offset the current buffer was written from
+    bool _completedFired;
+
+    /// <summary>True once a device is open and a clip is loaded.</summary>
     public bool IsOpen { get; private set; }
-    public bool IsPlaying { get; private set; }   // playing and not paused
+
+    /// <summary>True while audio is actively playing (open and not paused).</summary>
+    public bool IsPlaying { get; private set; }
+
+    /// <summary>True while loaded but paused.</summary>
     public bool IsPaused { get; private set; }
 
-    public long TotalBytes => _pcm.Length;
-    public int BytesPerSecond => _sampleRate * 2;
-    public TimeSpan Total => TimeSpan.FromSeconds((double)TotalBytes / BytesPerSecond);
-    public TimeSpan Current => TimeSpan.FromSeconds((double)PositionBytes / BytesPerSecond);
+    /// <summary>Total length of the loaded clip.</summary>
+    public TimeSpan Total => TimeSpan.FromSeconds((double)_pcm.Length / (_sampleRate * 2));
 
-    private long PositionBytes
+    /// <summary>Current playback position.</summary>
+    public TimeSpan Current => TimeSpan.FromSeconds((double)PositionBytes / (_sampleRate * 2));
+
+    long PositionBytes
     {
         get
         {
             if (!IsOpen) return 0;
-            var mmt = new MMTIME { wType = TIME_BYTES };
-            waveOutGetPosition(_hwo, ref mmt, (uint)Marshal.SizeOf<MMTIME>());
-            long pos = _startByte + mmt.u0;
-            return Math.Min(pos, TotalBytes);
+            MmTime time = new() { Type = TimeBytes };
+            waveOutGetPosition(_deviceHandle, ref time, (uint)Marshal.SizeOf<MmTime>());
+            return Math.Min(_bufferStartByte + time.Value, _pcm.Length);
         }
     }
 
-    /// <summary>Loads decoded PCM and writes it to the device in a paused state.</summary>
+    /// <summary>Opens the audio device and queues the clip in a paused state.</summary>
+    /// <param name="pcm">Little-endian 16-bit mono PCM samples.</param>
+    /// <param name="sampleRate">Sample rate in Hz.</param>
+    /// <param name="volume">Initial volume from 0 to 1.</param>
     public void Load(byte[] pcm, int sampleRate, float volume)
     {
         Stop();
         _pcm = pcm;
         _sampleRate = sampleRate;
 
-        var fmt = new WAVEFORMATEX
+        WaveFormat format = new()
         {
-            wFormatTag = WAVE_FORMAT_PCM,
-            nChannels = 1,
-            nSamplesPerSec = (uint)sampleRate,
-            wBitsPerSample = 16,
-            nBlockAlign = 2,
-            nAvgBytesPerSec = (uint)(sampleRate * 2),
-            cbSize = 0,
+            FormatTag = WaveFormatPcm,
+            Channels = 1,
+            SamplesPerSecond = (uint)sampleRate,
+            BitsPerSample = 16,
+            BlockAlign = 2,
+            AverageBytesPerSecond = (uint)(sampleRate * 2),
         };
-        Check(waveOutOpen(out _hwo, WAVE_MAPPER, ref fmt, IntPtr.Zero, IntPtr.Zero, CALLBACK_NULL));
+        Check(waveOutOpen(out _deviceHandle, WaveMapper, ref format, IntPtr.Zero, IntPtr.Zero, CallbackNull));
         IsOpen = true;
         SetVolume(volume);
         WriteFrom(0);
-        waveOutPause(_hwo);   // queued but held until Play()
-        IsPlaying = false;
+        waveOutPause(_deviceHandle);
         IsPaused = true;
         _completedFired = false;
     }
 
-    private void WriteFrom(long byteOffset)
-    {
-        _pcmHandle = GCHandle.Alloc(_pcm, GCHandleType.Pinned);
-        IntPtr data = _pcmHandle.AddrOfPinnedObject() + (int)byteOffset;
-
-        var hdr = new WAVEHDR
-        {
-            lpData = data,
-            dwBufferLength = (uint)(_pcm.Length - byteOffset),
-            dwFlags = 0,
-        };
-        _pHdr = Marshal.AllocHGlobal(Marshal.SizeOf<WAVEHDR>());
-        Marshal.StructureToPtr(hdr, _pHdr, false);
-
-        Check(waveOutPrepareHeader(_hwo, _pHdr, (uint)Marshal.SizeOf<WAVEHDR>()));
-        Check(waveOutWrite(_hwo, _pHdr, (uint)Marshal.SizeOf<WAVEHDR>()));
-        _startByte = byteOffset;
-    }
-
-    private void ReleaseBuffer()
-    {
-        if (_pHdr != IntPtr.Zero)
-        {
-            waveOutUnprepareHeader(_hwo, _pHdr, (uint)Marshal.SizeOf<WAVEHDR>());
-            Marshal.FreeHGlobal(_pHdr);
-            _pHdr = IntPtr.Zero;
-        }
-        if (_pcmHandle.IsAllocated) _pcmHandle.Free();
-    }
-
+    /// <summary>Resumes (or starts) playback.</summary>
     public void Play()
     {
         if (!IsOpen) return;
-        waveOutRestart(_hwo);
+        waveOutRestart(_deviceHandle);
         IsPlaying = true;
         IsPaused = false;
     }
 
+    /// <summary>Pauses playback, keeping the position.</summary>
     public void Pause()
     {
         if (!IsOpen) return;
-        waveOutPause(_hwo);
+        waveOutPause(_deviceHandle);
         IsPlaying = false;
         IsPaused = true;
     }
 
+    /// <summary>Stops playback and releases the device and buffer.</summary>
     public void Stop()
     {
         if (!IsOpen) return;
-        waveOutReset(_hwo);
+        waveOutReset(_deviceHandle);
         ReleaseBuffer();
-        waveOutClose(_hwo);
-        _hwo = IntPtr.Zero;
+        waveOutClose(_deviceHandle);
+        _deviceHandle = IntPtr.Zero;
         IsOpen = false;
         IsPlaying = false;
         IsPaused = false;
     }
 
+    /// <summary>Jumps to a position given as a fraction of the total length.</summary>
+    /// <param name="fraction">Target position from 0 (start) to 1 (end).</param>
     public void SeekFraction(double fraction)
     {
         if (!IsOpen) return;
-        fraction = Math.Clamp(fraction, 0, 1);
-        long target = (long)(fraction * TotalBytes);
+        long target = (long)(Math.Clamp(fraction, 0, 1) * _pcm.Length);
         target -= target % 2;                       // keep 16-bit sample alignment
         bool wasPlaying = IsPlaying;
 
-        waveOutReset(_hwo);
+        waveOutReset(_deviceHandle);
         ReleaseBuffer();
         WriteFrom(target);
-        if (wasPlaying) { waveOutRestart(_hwo); IsPlaying = true; IsPaused = false; }
-        else { waveOutPause(_hwo); IsPlaying = false; IsPaused = true; }
+        if (wasPlaying) Play();
+        else { waveOutPause(_deviceHandle); IsPaused = true; }
         _completedFired = false;
     }
 
+    /// <summary>Sets the output volume.</summary>
+    /// <param name="volume">Volume from 0 (silent) to 1 (full).</param>
     public void SetVolume(float volume)
     {
         if (!IsOpen) return;
-        uint v = (uint)(Math.Clamp(volume, 0f, 1f) * 0xFFFF);
-        waveOutSetVolume(_hwo, (v << 16) | v);      // both channels
+        uint level = (uint)(Math.Clamp(volume, 0f, 1f) * VolumeMax);
+        waveOutSetVolume(_deviceHandle, (level << 16) | level);
     }
 
-    /// <summary>Returns true exactly once when playback reaches the end of the buffer.</summary>
+    /// <summary>Reports end-of-clip exactly once, so a caller can auto-advance.</summary>
+    /// <returns>True on the first poll after playback reaches the end.</returns>
     public bool PollCompleted()
     {
-        if (!IsOpen || IsPaused || _completedFired) return false;
-        if (PositionBytes >= TotalBytes && TotalBytes > 0)
-        {
-            _completedFired = true;
-            IsPlaying = false;
-            return true;
-        }
-        return false;
+        if (!IsOpen || IsPaused || _completedFired || _pcm.Length == 0) return false;
+        if (PositionBytes < _pcm.Length) return false;
+        _completedFired = true;
+        IsPlaying = false;
+        return true;
     }
 
+    /// <summary>Stops playback and frees all native resources.</summary>
     public void Dispose() => Stop();
 
-    private static void Check(int mmResult)
+    /// <summary>Pins the PCM buffer and submits it to the device starting at a byte offset.</summary>
+    /// <param name="byteOffset">Offset into the PCM buffer to start playback from.</param>
+    void WriteFrom(long byteOffset)
     {
-        if (mmResult != 0) throw new InvalidOperationException($"waveOut error {mmResult}.");
+        _pcmPin = GCHandle.Alloc(_pcm, GCHandleType.Pinned);
+        int headerSize = Marshal.SizeOf<WaveHeader>();
+        WaveHeader header = new()
+        {
+            Data = _pcmPin.AddrOfPinnedObject() + (int)byteOffset,
+            BufferLength = (uint)(_pcm.Length - byteOffset),
+        };
+        _headerPtr = Marshal.AllocHGlobal(headerSize);
+        Marshal.StructureToPtr(header, _headerPtr, false);
+
+        Check(waveOutPrepareHeader(_deviceHandle, _headerPtr, (uint)headerSize));
+        Check(waveOutWrite(_deviceHandle, _headerPtr, (uint)headerSize));
+        _bufferStartByte = byteOffset;
     }
 
-    // ---- winmm interop ----
+    /// <summary>Unprepares and frees the current buffer header and unpins the PCM.</summary>
+    void ReleaseBuffer()
+    {
+        if (_headerPtr != IntPtr.Zero)
+        {
+            waveOutUnprepareHeader(_deviceHandle, _headerPtr, (uint)Marshal.SizeOf<WaveHeader>());
+            Marshal.FreeHGlobal(_headerPtr);
+            _headerPtr = IntPtr.Zero;
+        }
+        if (_pcmPin.IsAllocated) _pcmPin.Free();
+    }
 
-    private const ushort WAVE_FORMAT_PCM = 1;
-    private const uint WAVE_MAPPER = 0xFFFFFFFF;
-    private const uint CALLBACK_NULL = 0;
-    private const uint TIME_BYTES = 0x0004;
+    /// <summary>Throws if a winmm call returned a non-zero (error) result.</summary>
+    /// <param name="result">The MMRESULT returned by a waveOut function.</param>
+    static void Check(int result)
+    {
+        if (result != 0) throw new InvalidOperationException($"waveOut error {result}.");
+    }
 
+    #region winmm interop (1:1 Win32 waveOut bindings)
+
+    const ushort WaveFormatPcm = 1;
+    const uint WaveMapper = 0xFFFFFFFF;
+    const uint CallbackNull = 0;
+    const uint TimeBytes = 0x0004;
+
+    /// <summary>Win32 WAVEFORMATEX.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private struct WAVEFORMATEX
+    struct WaveFormat
     {
-        public ushort wFormatTag;
-        public ushort nChannels;
-        public uint nSamplesPerSec;
-        public uint nAvgBytesPerSec;
-        public ushort nBlockAlign;
-        public ushort wBitsPerSample;
-        public ushort cbSize;
+        public ushort FormatTag;
+        public ushort Channels;
+        public uint SamplesPerSecond;
+        public uint AverageBytesPerSecond;
+        public ushort BlockAlign;
+        public ushort BitsPerSample;
+        public ushort ExtraSize;
     }
 
+    /// <summary>Win32 WAVEHDR.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private struct WAVEHDR
+    struct WaveHeader
     {
-        public IntPtr lpData;
-        public uint dwBufferLength;
-        public uint dwBytesRecorded;
-        public IntPtr dwUser;
-        public uint dwFlags;
-        public uint dwLoops;
-        public IntPtr lpNext;
-        public IntPtr reserved;
+        public IntPtr Data;
+        public uint BufferLength;
+        public uint BytesRecorded;
+        public IntPtr User;
+        public uint Flags;
+        public uint Loops;
+        public IntPtr Next;
+        public IntPtr Reserved;
     }
 
+    /// <summary>Win32 MMTIME; only the byte-count member of the union is used here.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private struct MMTIME
+    struct MmTime
     {
-        public uint wType;
-        public uint u0;
-        public uint u1;
+        public uint Type;
+        public uint Value;
+        public uint Padding;
     }
 
-    [DllImport("winmm.dll")] private static extern int waveOutOpen(out IntPtr hwo, uint uDeviceID, ref WAVEFORMATEX fmt, IntPtr dwCallback, IntPtr dwInstance, uint fdwOpen);
-    [DllImport("winmm.dll")] private static extern int waveOutPrepareHeader(IntPtr hwo, IntPtr pwh, uint cbwh);
-    [DllImport("winmm.dll")] private static extern int waveOutWrite(IntPtr hwo, IntPtr pwh, uint cbwh);
-    [DllImport("winmm.dll")] private static extern int waveOutUnprepareHeader(IntPtr hwo, IntPtr pwh, uint cbwh);
-    [DllImport("winmm.dll")] private static extern int waveOutPause(IntPtr hwo);
-    [DllImport("winmm.dll")] private static extern int waveOutRestart(IntPtr hwo);
-    [DllImport("winmm.dll")] private static extern int waveOutReset(IntPtr hwo);
-    [DllImport("winmm.dll")] private static extern int waveOutClose(IntPtr hwo);
-    [DllImport("winmm.dll")] private static extern int waveOutGetPosition(IntPtr hwo, ref MMTIME pmmt, uint cbmmt);
-    [DllImport("winmm.dll")] private static extern int waveOutSetVolume(IntPtr hwo, uint dwVolume);
+    [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr deviceHandle, uint deviceId, ref WaveFormat format, IntPtr callback, IntPtr instance, uint openFlags);
+    [DllImport("winmm.dll")] static extern int waveOutPrepareHeader(IntPtr deviceHandle, IntPtr header, uint headerSize);
+    [DllImport("winmm.dll")] static extern int waveOutWrite(IntPtr deviceHandle, IntPtr header, uint headerSize);
+    [DllImport("winmm.dll")] static extern int waveOutUnprepareHeader(IntPtr deviceHandle, IntPtr header, uint headerSize);
+    [DllImport("winmm.dll")] static extern int waveOutPause(IntPtr deviceHandle);
+    [DllImport("winmm.dll")] static extern int waveOutRestart(IntPtr deviceHandle);
+    [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr deviceHandle);
+    [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr deviceHandle);
+    [DllImport("winmm.dll")] static extern int waveOutGetPosition(IntPtr deviceHandle, ref MmTime time, uint timeSize);
+    [DllImport("winmm.dll")] static extern int waveOutSetVolume(IntPtr deviceHandle, uint volume);
+
+    #endregion
 }
