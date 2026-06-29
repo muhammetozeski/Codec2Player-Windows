@@ -4,7 +4,7 @@ A small Windows desktop player for **Codec 2** (`.c2`) speech files — includin
 ultra‑low‑bitrate **450 bps** mode. WinForms UI, a simple playlist and a transport
 bar.
 
-[![build](https://github.com/muhammetozeski/Codec2Player/actions/workflows/build.yml/badge.svg)](https://github.com/muhammetozeski/Codec2Player/actions/workflows/build.yml)
+[![build](https://github.com/muhammetozeski/Codec2Player-Windows/actions/workflows/build.yml/badge.svg)](https://github.com/muhammetozeski/Codec2Player-Windows/actions/workflows/build.yml)
 
 ---
 
@@ -48,14 +48,14 @@ third‑party audio library.
 ## Download
 
 Get the latest build from the
-[**Releases**](https://github.com/muhammetozeski/Codec2Player/releases) page and run
+[**Releases**](https://github.com/muhammetozeski/Codec2Player-Windows/releases) page and run
 `Codec2Player.exe`.
 
 ## Build from source
 
 ```powershell
-git clone --recursive https://github.com/muhammetozeski/Codec2Player.git
-cd Codec2Player
+git clone --recursive https://github.com/muhammetozeski/Codec2Player-Windows.git
+cd Codec2Player-Windows
 dotnet build src/Codec2Player.csproj -c Release
 dotnet run  --project src/Codec2Player.csproj -c Release
 ```
